@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.accumulo.core.fate.Fate.TxInfo;
@@ -52,7 +53,7 @@ public abstract class AbstractFateStore<T> implements FateStore<T> {
   private static final Logger log = LoggerFactory.getLogger(AbstractFateStore.class);
 
   protected final Set<Long> reserved;
-  protected final Map<Long,Long> defered;
+  protected final Map<Long,Long> deferred;
 
   // This is incremented each time a transaction was unreserved that was non new
   protected final SignalCount unreservedNonNewCount = new SignalCount();
@@ -62,7 +63,7 @@ public abstract class AbstractFateStore<T> implements FateStore<T> {
 
   public AbstractFateStore() {
     this.reserved = new HashSet<>();
-    this.defered = new HashMap<>();
+    this.deferred = new HashMap<>();
   }
 
   public static byte[] serialize(Object o) {
@@ -144,12 +145,12 @@ public abstract class AbstractFateStore<T> implements FateStore<T> {
 
       synchronized (this) {
         runnableTids.removeIf(txid -> {
-          var deferedTime = defered.get(txid);
-          if (deferedTime != null) {
-            if (deferedTime >= System.currentTimeMillis()) {
+          var deferredTime = deferred.get(txid);
+          if (deferredTime != null) {
+            if ((deferredTime - System.nanoTime()) >= 0) {
               return true;
             } else {
-              defered.remove(txid);
+              deferred.remove(txid);
             }
           }
 
@@ -164,9 +165,10 @@ public abstract class AbstractFateStore<T> implements FateStore<T> {
       if (runnableTids.isEmpty()) {
         if (beforeCount == unreservedRunnableCount.getCount()) {
           long waitTime = 5000;
-          if (!defered.isEmpty()) {
-            Long minTime = Collections.min(defered.values());
-            waitTime = minTime - System.currentTimeMillis();
+          if (!deferred.isEmpty()) {
+            Long minTime = Collections.min(deferred.values());
+            waitTime = minTime - System.nanoTime();
+            waitTime = TimeUnit.MILLISECONDS.convert(waitTime, TimeUnit.NANOSECONDS);
           }
 
           if (waitTime > 0) {
@@ -242,7 +244,8 @@ public abstract class AbstractFateStore<T> implements FateStore<T> {
     }
 
     @Override
-    public void unreserve(long deferTime) {
+    public void unreserve(long deferTime, TimeUnit deferTimeUnit) {
+      deferTime = TimeUnit.NANOSECONDS.convert(deferTime, deferTimeUnit);
 
       if (deferTime < 0) {
         throw new IllegalArgumentException("deferTime < 0 : " + deferTime);
@@ -258,7 +261,7 @@ public abstract class AbstractFateStore<T> implements FateStore<T> {
         AbstractFateStore.this.notifyAll();
 
         if (deferTime > 0) {
-          defered.put(tid, System.currentTimeMillis() + deferTime);
+          deferred.put(tid, System.nanoTime() + deferTime);
         }
       }
 
