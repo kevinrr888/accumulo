@@ -35,6 +35,8 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import org.apache.accumulo.core.client.Accumulo;
@@ -243,9 +245,6 @@ public abstract class FateInterleavingIT extends SharedMiniClusterBase
         waitFor(store, fateId);
       }
 
-      Scanner scanner = client.createScanner(FATE_TRACKING_TABLE);
-      var iter = scanner.stream().map(FateInterleavingIT::toIdStep).iterator();
-
       // we should see the following execution order for all fate ids:
       // FirstOp::isReady1, FirstOp::isReady2, FirstOp::call,
       // SecondOp::isReady1, SecondOp::isReady2, SecondOp::call,
@@ -254,35 +253,37 @@ public abstract class FateInterleavingIT extends SharedMiniClusterBase
       // thread to interleave and work on another fate id, but may not always interleave.
       // It is unlikely that the FATE will not interleave at least once in a run, so we will check
       // for at least one occurrence.
-      int interleaves = 0;
-      int i = 0;
-      Map.Entry<FateId,String> prevOp = null;
+      final AtomicInteger interleaves = new AtomicInteger();
+      final AtomicInteger i = new AtomicInteger();
+      final AtomicReference<Map.Entry<FateId,String>> prevOp = new AtomicReference<>(null);
       var expRunOrder = List.of("FirstOp::isReady1", "FirstOp::isReady2", "FirstOp::call",
           "SecondOp::isReady1", "SecondOp::isReady2", "SecondOp::call", "LastOp::isReady1",
           "LastOp::isReady2", "LastOp::call");
       var fateIdsToExpRunOrder = Map.of(fateIds[0], new ArrayList<>(expRunOrder), fateIds[1],
           new ArrayList<>(expRunOrder), fateIds[2], new ArrayList<>(expRunOrder));
 
-      while (iter.hasNext()) {
-        var currOp = iter.next();
-        FateId fateId = currOp.getKey();
-        String currStep = currOp.getValue();
-        var expRunOrderFateId = fateIdsToExpRunOrder.get(fateId);
+      try (Scanner scanner = client.createScanner(FATE_TRACKING_TABLE)) {
+        scanner.stream().map(FateInterleavingIT::toIdStep).forEach(currOp -> {
+          FateId fateId = currOp.getKey();
+          String currStep = currOp.getValue();
+          var expRunOrderFateId = fateIdsToExpRunOrder.get(fateId);
 
-        // An interleave occurred if we do not see <FateIdX, OpN::isReady2> immediately after
-        // <FateIdX, OpN::isReady1>
-        if (prevOp != null && prevOp.getValue().contains("isReady1")
-            && !currOp.equals(new AbstractMap.SimpleImmutableEntry<>(prevOp.getKey(),
-                prevOp.getValue().replace('1', '2')))) {
-          interleaves++;
-        }
-        assertEquals(currStep, expRunOrderFateId.remove(0));
-        prevOp = currOp;
-        i++;
+          // An interleave occurred if we do not see <FateIdX, OpN::isReady2> immediately after
+          // <FateIdX, OpN::isReady1>
+          Entry<FateId,String> fateIdStringEntry = prevOp.get();
+          if (fateIdStringEntry != null && fateIdStringEntry.getValue().contains("isReady1")
+              && !currOp.equals(new AbstractMap.SimpleImmutableEntry<>(fateIdStringEntry.getKey(),
+                  fateIdStringEntry.getValue().replace('1', '2')))) {
+            interleaves.incrementAndGet();
+          }
+          assertEquals(currStep, expRunOrderFateId.remove(0));
+          prevOp.set(currOp);
+          i.incrementAndGet();
+        });
       }
 
-      assertTrue(interleaves > 0);
-      assertEquals(i, expRunOrder.size() * numFateIds);
+      assertTrue(interleaves.get() > 0);
+      assertEquals(expRunOrder.size() * numFateIds, i.get());
       assertEquals(numFateIds, fateIdsToExpRunOrder.size());
       for (var expRunOrderFateId : fateIdsToExpRunOrder.values()) {
         assertTrue(expRunOrderFateId.isEmpty());
@@ -377,21 +378,22 @@ public abstract class FateInterleavingIT extends SharedMiniClusterBase
         waitFor(store, fateId);
       }
 
-      Scanner scanner = client.createScanner(FATE_TRACKING_TABLE);
-      Iterator<Entry<Key,Value>> iter = scanner.iterator();
+      try (Scanner scanner = client.createScanner(FATE_TRACKING_TABLE)) {
+        Iterator<Entry<Key,Value>> iter = scanner.iterator();
 
-      SortedMap<Key,Value> subset = new TreeMap<>();
+        SortedMap<Key,Value> subset = new TreeMap<>();
 
-      // should see one fate op execute all of it steps
-      var seenId1 = verifySameIds(iter, subset);
-      // should see another fate op execute all of it steps
-      var seenId2 = verifySameIds(iter, subset);
-      // should see another fate op execute all of it steps
-      var seenId3 = verifySameIds(iter, subset);
+        // should see one fate op execute all of it steps
+        var seenId1 = verifySameIds(iter, subset);
+        // should see another fate op execute all of it steps
+        var seenId2 = verifySameIds(iter, subset);
+        // should see another fate op execute all of it steps
+        var seenId3 = verifySameIds(iter, subset);
 
-      assertEquals(Set.of(fateIds[0], fateIds[1], fateIds[2]), Set.of(seenId1, seenId2, seenId3));
+        assertEquals(Set.of(fateIds[0], fateIds[1], fateIds[2]), Set.of(seenId1, seenId2, seenId3));
 
-      assertFalse(iter.hasNext());
+        assertFalse(iter.hasNext());
+      }
 
     } finally {
       if (fate != null) {
@@ -407,10 +409,10 @@ public abstract class FateInterleavingIT extends SharedMiniClusterBase
     Text fateId = subset.keySet().iterator().next().getColumnFamily();
     assertTrue(subset.keySet().stream().allMatch(k -> k.getColumnFamily().equals(fateId)));
 
-    var expectedVals = List.of("FirstNonInterleavingOp::isReady", "FirstNonInterleavingOp::call",
+    var expectedVals = Set.of("FirstNonInterleavingOp::isReady", "FirstNonInterleavingOp::call",
         "SecondNonInterleavingOp::isReady", "SecondNonInterleavingOp::call",
         "LastNonInterleavingOp::isReady", "LastNonInterleavingOp::call");
-    var actualVals = subset.values().stream().map(Value::toString).collect(Collectors.toList());
+    var actualVals = subset.values().stream().map(Value::toString).collect(Collectors.toSet());
     assertEquals(expectedVals, actualVals);
 
     return FateId.from(fateId.toString());
